@@ -2,9 +2,12 @@ from fastapi import FastAPI, File, UploadFile, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import PyPDF2
 import io
+import os
 import base64
 import logging
 from typing import Optional
+
+from statement_parser import parse_statement, parse_csv, llm_fallback
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -169,6 +172,100 @@ async def check_pdf_encryption(file: UploadFile = File(...)):
             status_code=500,
             detail=f"Error checking PDF encryption: {str(e)}"
         )
+
+MAX_UPLOAD = 25 * 1024 * 1024
+COVERAGE_FOR_RULES = 0.9
+
+
+def _decrypt_if_needed(pdf_content: bytes, password: Optional[str]) -> bytes:
+    reader = PyPDF2.PdfReader(io.BytesIO(pdf_content))
+    if not reader.is_encrypted:
+        return pdf_content
+    if not password or not reader.decrypt(password):
+        raise HTTPException(status_code=400, detail="Invalid password. Could not decrypt the PDF.")
+    writer = PyPDF2.PdfWriter()
+    for page in reader.pages:
+        writer.add_page(page)
+    buf = io.BytesIO()
+    writer.write(buf)
+    return buf.getvalue()
+
+
+def _summary(res, engine: str, transactions: list) -> dict:
+    return {
+        "success": len(transactions) > 0,
+        "engine": engine,
+        "transactions": transactions,
+        "transaction_count": len(transactions),
+        "page_count": res.pages,
+        "header_found": res.header_found,
+        "rows_seen": res.rows_seen,
+        "rows_parsed": res.rows_parsed,
+        "coverage": round(res.coverage, 3),
+        "balance_checked": res.balance_checked,
+        "balance_verified": res.balance_ok,
+        "warnings": res.warnings,
+        "message": None if transactions else "No transactions found. The statement may be scanned or in an unsupported layout.",
+    }
+
+
+@app.post("/parse-statement")
+async def parse_statement_endpoint(
+    file: UploadFile = File(...),
+    password: Optional[str] = Form(None),
+    allow_llm: bool = Form(True),
+):
+    """Unlock (if needed) and parse a bank statement PDF into transactions.
+
+    Rules first; the LLM (through expense-ai-proxy, with the extracted text
+    only) is used when the rules cover fewer than 90 % of the rows and the
+    server has AI_PROXY_URL / AI_PROXY_KEY configured.
+    """
+    pdf_content = await file.read()
+    if len(pdf_content) > MAX_UPLOAD:
+        raise HTTPException(status_code=413, detail="File too large (max 25 MB)")
+    try:
+        pdf_content = _decrypt_if_needed(pdf_content, password)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Could not read the PDF: {e}")
+    try:
+        res = parse_statement(pdf_content)
+    except Exception as e:
+        logger.exception("statement parse failed")
+        raise HTTPException(status_code=500, detail=f"Parser error: {e}")
+    if res.coverage >= COVERAGE_FOR_RULES and res.transactions:
+        return _summary(res, "rules", res.transactions)
+    proxy_url, proxy_key = os.environ.get("AI_PROXY_URL"), os.environ.get("AI_PROXY_KEY")
+    if allow_llm and proxy_url and proxy_key and res.text.strip():
+        try:
+            txns = llm_fallback(res.text, proxy_url, proxy_key)
+            out = _summary(res, "llm", txns)
+            out["warnings"] = res.warnings + [f"rules covered {res.coverage:.0%} of rows; model used"]
+            return out
+        except Exception as e:
+            logger.warning("LLM fallback failed: %s", e)
+            out = _summary(res, "rules", res.transactions)
+            out["warnings"] = res.warnings + [f"model fallback failed: {str(e)[:120]}"]
+            return out
+    return _summary(res, "rules", res.transactions)
+
+
+@app.post("/parse-csv")
+async def parse_csv_endpoint(file: UploadFile = File(...)):
+    raw = await file.read()
+    if len(raw) > MAX_UPLOAD:
+        raise HTTPException(status_code=413, detail="File too large (max 25 MB)")
+    for enc in ("utf-8-sig", "utf-8", "latin-1"):
+        try:
+            text = raw.decode(enc)
+            break
+        except UnicodeDecodeError:
+            continue
+    res = parse_csv(text)
+    return _summary(res, "rules", res.transactions)
+
 
 if __name__ == "__main__":
     import uvicorn
