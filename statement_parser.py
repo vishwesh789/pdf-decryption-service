@@ -409,6 +409,12 @@ class ParseResult:
                 return code
         if "$" in t:
             return "USD"
+        if re.search(r"\b(?:UPI|IMPS|NEFT|RTGS|IFSC)\b", t):
+            return "INR"
+        if re.search(r"\bsort code\b", t, re.I):
+            return "GBP"
+        if re.search(r"\brouting (?:number|no\.?)\b|\bACH\b", t, re.I):
+            return "USD"
         return None
 
     @property
