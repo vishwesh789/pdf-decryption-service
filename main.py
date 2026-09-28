@@ -205,7 +205,8 @@ def _summary(res, engine: str, transactions: list) -> dict:
         "balance_checked": res.balance_checked,
         "balance_verified": res.balance_ok,
         "warnings": res.warnings,
-        "message": None if transactions else "No transactions found. The statement may be scanned or in an unsupported layout.",
+        "scanned": res.scanned,
+        "message": None if transactions else ("This PDF has no text layer (scanned image)." if res.scanned else "No transaction table recognised in this statement layout."),
     }
 
 

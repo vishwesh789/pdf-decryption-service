@@ -268,6 +268,8 @@ def _looks_like_code(tok: str) -> bool:
         return True
     if re.fullmatch(r"[\d\-/:. ]+", t) or DATE_TOKEN.fullmatch(t):
         return True
+    if re.search(r"\b\d{1,2}:\d{2}(:\d{2})?\b", t) and not re.search(r"[A-Za-z]{3}", re.sub(r"\d{1,2}:\d{2}(:\d{2})?", "", t)):
+        return True  # timestamps
     if sum(ch.isdigit() for ch in t) >= max(4, len(t) // 2):
         return True
     if not re.search(r"[A-Za-zÀ-ÿ]{2}", t):
@@ -291,6 +293,7 @@ def describe(description: str, txn_type: str) -> tuple[str, str, str]:
     if re.search(r"\bcash\b|bargeld|especes|efectivo", low) and "cashback" not in low:
         method = "cash"
     d_clean = d if d.lower().startswith(("upi", "imps", "neft")) else DATE_FRAGMENT.sub(" ", d)
+    d_clean = re.sub(r"\b\d{1,2}:\d{2}(:\d{2})?\b", " ", d_clean)  # timestamps inside narrations
     tokens = [t for t in re.split(r"[/|*]+|\s[-–—]\s|(?<=\D)-(?=\D)", d_clean) if t and t.strip()]
     if len(tokens) <= 1:
         tokens = [d_clean]
@@ -301,6 +304,10 @@ def describe(description: str, txn_type: str) -> tuple[str, str, str]:
         cleaned = re.sub(r"\s+", " ", cleaned).strip(" -/.,:")
         if cleaned and re.search(r"[A-Za-zÀ-ÿ]{2}", cleaned) and not _looks_like_code(cleaned):
             cands.append(cleaned)
+    if not cands:
+        vpa = re.search(r"([A-Za-z][A-Za-z0-9._-]{2,})@[A-Za-z]{2,}", d)
+        if vpa:
+            cands.append(re.sub(r"[._-]+", " ", vpa.group(1)).strip())
     merchant = cands[0] if cands else (re.sub(r"[\d/\-:]+", " ", d).strip()[:40] or "Unknown")
     merchant = BANK_WORDS.sub("", merchant).strip(" -/.,")
     merchant = re.sub(r"\s+", " ", merchant)[:48] or "Unknown"
@@ -391,6 +398,10 @@ class ParseResult:
     warnings: list[str] = field(default_factory=list)
     text: str = ""
     locale: Locale = field(default_factory=Locale)
+
+    @property
+    def scanned(self) -> bool:
+        return len(self.text.strip()) < 40 * max(self.pages, 1)
 
     @property
     def coverage(self) -> float:
@@ -758,11 +769,18 @@ def parse_statement(pdf_bytes: bytes, password: str | None = None) -> ParseResul
         bands_prev = None
         section = None
         for pno, page in enumerate(pdf.pages, start=1):
-            rows, roles, seen, section = _rows_from_ruled_tables(page, pno, roles_prev, loc, section)
-            if roles:
-                roles_prev = roles
-            if not rows:
-                rows, bands, seen, section = _rows_from_words(page, pno, bands_prev, loc, section)
+            # Try both strategies and keep whichever found more dated rows: a
+            # ruled summary box must not hide an unruled transaction table.
+            r_rows, roles, r_seen, r_section = _rows_from_ruled_tables(page, pno, roles_prev, loc, section)
+            w_rows, bands, w_seen, w_section = _rows_from_words(page, pno, bands_prev, loc, section)
+            r_dated = sum(1 for r in r_rows if r.date)
+            w_dated = sum(1 for r in w_rows if r.date)
+            if r_dated >= w_dated and r_rows:
+                rows, seen, section = r_rows, r_seen, r_section
+                if roles:
+                    roles_prev = roles
+            else:
+                rows, seen, section = w_rows, w_seen, w_section
                 if bands:
                     bands_prev = bands
             res.rows_seen += seen
