@@ -400,6 +400,18 @@ class ParseResult:
     locale: Locale = field(default_factory=Locale)
 
     @property
+    def currency(self) -> str | None:
+        t = self.text[:6000]
+        for code, pat in (("INR", r"₹|\bINR\b|\bRs\.?"), ("USD", r"\bUSD\b|US\$"), ("GBP", r"£|\bGBP\b"), ("EUR", r"€|\bEUR\b"),
+                          ("AUD", r"\bAUD\b|A\$"), ("CAD", r"\bCAD\b|C\$"), ("SGD", r"\bSGD\b|S\$"), ("AED", r"\bAED\b"),
+                          ("CHF", r"\bCHF\b"), ("JPY", r"¥|\bJPY\b")):
+            if re.search(pat, t):
+                return code
+        if "$" in t:
+            return "USD"
+        return None
+
+    @property
     def scanned(self) -> bool:
         return len(self.text.strip()) < 40 * max(self.pages, 1)
 
@@ -690,7 +702,7 @@ def _rows_from_words(page, page_no, bands_prev, loc, section_prev):
     bands = bands_prev
     rows: list[Row] = []
     seen = 0
-    pending_text: list[str] = []
+    pending_text: list[tuple[str, float]] = []
     last_row: Row | None = None
     last_bottom = None
     section = section_prev
@@ -713,9 +725,12 @@ def _rows_from_words(page, page_no, bands_prev, loc, section_prev):
     has_dc = bool({"debit", "credit"} & set(roles.values()))
     clusters = _numeric_clusters(bands, [ln for ln in lines[start:] if not _header_bands(ln["words"])])
 
-    for ln in lines[start:]:
+    header_tail = re.compile(r"^(amt\.?|amount|dt\.?|date|no\.?|number|balance|closing|opening|\(.*\)|[a-z]{1,3}\.?)$", re.I)
+    for idx, ln in enumerate(lines[start:]):
         if _header_bands(ln["words"]):
             continue
+        if idx == 0 and all(header_tail.match(w["text"]) for w in ln["words"]) and len(ln["words"]) <= 8:
+            continue  # the wrapped second line of the header
         by_band = _assign(bands, ln["words"], clusters)
         cells = [" ".join(by_band.get(i, [])) for i in range(len(bands))]
         text_all = " ".join(c for c in cells if c).strip()
@@ -732,7 +747,9 @@ def _rows_from_words(page, page_no, bands_prev, loc, section_prev):
         if row is not None and has_amount:
             seen += 1
             if pending_text:
-                row.desc = (" ".join(pending_text) + " " + row.desc).strip()
+                near = [t for t, bottom in pending_text if ln["top"] - bottom < 18]
+                if near:
+                    row.desc = (" ".join(near) + " " + row.desc).strip()
                 pending_text = []
             rows.append(row)
             last_row = row
@@ -748,7 +765,7 @@ def _rows_from_words(page, page_no, bands_prev, loc, section_prev):
                 last_row.desc = (last_row.desc + " " + text_all).strip()
                 last_bottom = ln["bottom"]
             else:
-                pending_text.append(text_all)
+                pending_text.append((text_all, ln["bottom"]))
                 if len(pending_text) > 3:
                     pending_text = pending_text[-3:]
     return rows, bands, seen, section
@@ -793,6 +810,13 @@ def parse_statement(pdf_bytes: bytes, password: str | None = None) -> ParseResul
 def _finalise(rows: list[Row], res: ParseResult) -> list[dict]:
     txns: list[dict] = []
     loc = res.locale
+    dated = [r.date for r in rows if r.date]
+    if len(dated) >= 3:
+        asc = sum(1 for a, b in zip(dated, dated[1:]) if b > a)
+        desc = sum(1 for a, b in zip(dated, dated[1:]) if b < a)
+        if desc > asc:
+            rows = list(reversed(rows))
+            res.warnings.append("statement listed newest first; rows reordered oldest first")
     prev_balance: Decimal | None = None
     swap_votes = keep_votes = 0
     for r in rows:

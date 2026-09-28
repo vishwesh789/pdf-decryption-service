@@ -155,6 +155,12 @@ async def check_pdf_encryption(file: UploadFile = File(...)):
         pdf_reader = PyPDF2.PdfReader(io.BytesIO(pdf_content))
 
         is_encrypted = pdf_reader.is_encrypted
+        if is_encrypted:
+            try:
+                if pdf_reader.decrypt(""):
+                    is_encrypted = False  # owner-password only: readable without a password
+            except Exception:
+                pass
         page_count = len(pdf_reader.pages) if not is_encrypted else None
 
         logger.info(f"Encryption check result: {is_encrypted}")
@@ -181,7 +187,12 @@ def _decrypt_if_needed(pdf_content: bytes, password: Optional[str]) -> bytes:
     reader = PyPDF2.PdfReader(io.BytesIO(pdf_content))
     if not reader.is_encrypted:
         return pdf_content
-    if not password or not reader.decrypt(password):
+    opened = False
+    try:
+        opened = bool(reader.decrypt(""))  # owner-password-only files open without a user password
+    except Exception:
+        opened = False
+    if not opened and not (password and reader.decrypt(password)):
         raise HTTPException(status_code=400, detail="Invalid password. Could not decrypt the PDF.")
     writer = PyPDF2.PdfWriter()
     for page in reader.pages:
@@ -206,6 +217,7 @@ def _summary(res, engine: str, transactions: list) -> dict:
         "balance_verified": res.balance_ok,
         "warnings": res.warnings,
         "scanned": res.scanned,
+        "currency": res.currency,
         "message": None if transactions else ("This PDF has no text layer (scanned image)." if res.scanned else "No transaction table recognised in this statement layout."),
     }
 
